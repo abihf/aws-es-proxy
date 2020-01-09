@@ -8,9 +8,6 @@ RUN apk add git \
 
 CMD CGO_ENABLED=0 GOOS=linux go build -o /usr/local/bin/ aws-es-proxy.go
 
-FROM alpine:3.11
-LABEL name="aws-es-proxy" version="latest"
-
 RUN apk --no-cache add ca-certificates
 
 ENTRYPOINT ["aws-es-proxy"]
