@@ -2,26 +2,22 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
 	"os"
 	"path"
-	"regexp"
 	"strings"
 	"time"
 
-	// log "github.com/Sirupsen/logrus"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/aws/signer/v4"
-	uuid "github.com/satori/go.uuid"
+	v4 "github.com/aws/aws-sdk-go/aws/signer/v4"
+	"github.com/golang/glog"
 )
 
 type requestStruct struct {
@@ -41,27 +37,27 @@ type responseStruct struct {
 }
 
 type proxy struct {
-	scheme       string
-	host         string
-	region       string
-	service      string
-	endpoint     string
-	verbose      bool
-	prettify     bool
-	logtofile    bool
-	nosignreq    bool
-	fileRequest  *os.File
-	fileResponse *os.File
-	credentials  *credentials.Credentials
+	scheme      string
+	host        string
+	region      string
+	service     string
+	endpoint    string
+	nosignreq   bool
+	credentials *credentials.Credentials
+}
+
+var client = &http.Client{
+	CheckRedirect: noRedirect,
+}
+
+func noRedirect(req *http.Request, via []*http.Request) error {
+	return http.ErrUseLastResponse
 }
 
 func newProxy(args ...interface{}) *proxy {
 	return &proxy{
 		endpoint:  args[0].(string),
-		verbose:   args[1].(bool),
-		prettify:  args[2].(bool),
-		logtofile: args[3].(bool),
-		nosignreq: args[4].(bool),
+		nosignreq: args[1].(bool),
 	}
 }
 
@@ -112,48 +108,39 @@ func (p *proxy) getSigner() *v4.Signer {
 		sess := session.Must(session.NewSession())
 		credentials := sess.Config.Credentials
 		p.credentials = credentials
-		log.Println("Generated fresh AWS Credentials object")
+		glog.Info("Generated fresh AWS Credentials object")
 	}
 	return v4.NewSigner(p.credentials)
 }
 
-func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	requestStarted := time.Now()
-	dump, err := httputil.DumpRequest(r, true)
-	if err != nil {
-		log.Fatalln("error while dumping request. Error: ", err.Error())
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer r.Body.Close()
+func (p *proxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	defer req.Body.Close()
 
-	ep := *r.URL
-	ep.Host = p.host
-	ep.Scheme = p.scheme
-	ep.Path = path.Clean(ep.Path)
+	url := *req.URL
+	url.Host = p.host
+	url.Scheme = p.scheme
+	url.Path = path.Clean(url.Path)
 
-	req, err := http.NewRequest(r.Method, ep.String(), r.Body)
+	proxyReq, err := http.NewRequest(req.Method, url.String(), req.Body)
 	if err != nil {
-		log.Fatalln("error creating new request. ", err.Error())
+		glog.Fatalln("error creating new request. ", err.Error())
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	addHeaders(r.Header, req.Header)
+	addHeaders(req.Header, proxyReq.Header)
 
 	// Make signV4 optional
 	if !p.nosignreq {
-		// Start AWS session from ENV, Shared Creds or EC2Role
 		signer := p.getSigner()
-
-		// Sign the request with AWSv4
-		payload := bytes.NewReader(replaceBody(req))
-		signer.Sign(req, payload, p.service, p.region, time.Now())
+		// Start AWS session from ENV, Shared Creds or EC2Role
+		payload := bytes.NewReader(replaceBody(proxyReq))
+		signer.Sign(proxyReq, payload, p.service, p.region, time.Now())
 	}
-
-	resp, err := http.DefaultClient.Do(req)
+	glog.Info("Proxying request to ES")
+	resp, err := client.Do(proxyReq)
 	if err != nil {
-		log.Fatalln(err.Error())
+		glog.Fatalln(err.Error())
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -179,80 +166,6 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	w.Write(body.Bytes())
-
-	requestEnded := time.Since(requestStarted)
-
-	/*############################
-	## Logging
-	############################*/
-
-	rawQuery := string(dump)
-	rawQuery = strings.Replace(rawQuery, "\n", " ", -1)
-	regex, _ := regexp.Compile("{.*}")
-	regEx, _ := regexp.Compile("_msearch|_bulk")
-	queryEx := regEx.FindString(rawQuery)
-
-	var query string
-
-	if len(queryEx) == 0 {
-		query = regex.FindString(rawQuery)
-	} else {
-		query = ""
-	}
-
-	if p.verbose {
-		if p.prettify {
-			var prettyBody bytes.Buffer
-			json.Indent(&prettyBody, []byte(query), "", "  ")
-			t := time.Now()
-
-			fmt.Println()
-			fmt.Println("========================")
-			fmt.Println(t.Format("2006/01/02 15:04:05"))
-			fmt.Println("Remote Address: ", r.RemoteAddr)
-			fmt.Println("Request URI: ", ep.RequestURI())
-			fmt.Println("Method: ", r.Method)
-			fmt.Println("Status: ", resp.StatusCode)
-			fmt.Printf("Took: %.3fs\n", requestEnded.Seconds())
-			fmt.Println("Body: ")
-			fmt.Println(string(prettyBody.Bytes()))
-		} else {
-			log.Printf(" -> %s; %s; %s; %s; %d; %.3fs\n",
-				r.Method, r.RemoteAddr,
-				ep.RequestURI(), query,
-				resp.StatusCode, requestEnded.Seconds())
-		}
-	}
-
-	if p.logtofile {
-
-		requestID, _ := uuid.NewV4()
-
-		reqStruct := &requestStruct{
-			Requestid:  requestID.String(),
-			Datetime:   time.Now().Format("2006/01/02 15:04:05"),
-			Remoteaddr: r.RemoteAddr,
-			Requesturi: ep.RequestURI(),
-			Method:     r.Method,
-			Statuscode: resp.StatusCode,
-			Elapsed:    requestEnded.Seconds(),
-			Body:       query,
-		}
-
-		respStruct := &responseStruct{
-			Requestid: requestID.String(),
-			Body:      string(body.Bytes()),
-		}
-
-		y, _ := json.Marshal(reqStruct)
-		z, _ := json.Marshal(respStruct)
-		p.fileRequest.Write(y)
-		p.fileRequest.WriteString("\n")
-		p.fileResponse.Write(z)
-		p.fileResponse.WriteString("\n")
-
-	}
-
 }
 
 // Recent versions of ES/Kibana require
@@ -287,25 +200,23 @@ func copyHeaders(dst, src http.Header) {
 	}
 }
 
+func init() {
+	flag.Set("logtostderr", "true")
+	flag.Set("stderrthreshold", "WARNING")
+	flag.Set("v", "2")
+}
+
 func main() {
 
 	var (
-		verbose       bool
-		prettify      bool
-		logtofile     bool
 		nosignreq     bool
 		endpoint      string
 		listenAddress string
-		fileRequest   *os.File
-		fileResponse  *os.File
 		err           error
 	)
 
 	flag.StringVar(&endpoint, "endpoint", "", "Amazon ElasticSearch Endpoint (e.g: https://dummy-host.eu-west-1.es.amazonaws.com)")
 	flag.StringVar(&listenAddress, "listen", "127.0.0.1:9200", "Local TCP port to listen on")
-	flag.BoolVar(&verbose, "verbose", false, "Print user requests")
-	flag.BoolVar(&logtofile, "log-to-file", false, "Log user requests and ElasticSearch responses to files")
-	flag.BoolVar(&prettify, "pretty", false, "Prettify verbose and file output")
 	flag.BoolVar(&nosignreq, "no-sign-reqs", false, "Disable AWS Signature v4")
 	flag.Parse()
 
@@ -317,38 +228,14 @@ func main() {
 
 	p := newProxy(
 		endpoint,
-		verbose,
-		prettify,
-		logtofile,
 		nosignreq,
 	)
 
 	if err = p.parseEndpoint(); err != nil {
-		log.Fatalln(err)
+		glog.Fatalln(err)
 		os.Exit(1)
 	}
 
-	if p.logtofile {
-		u1, _ := uuid.NewV4()
-		u2, _ := uuid.NewV4()
-		requestFname := fmt.Sprintf("request-%s.log", u1.String())
-		responseFname := fmt.Sprintf("response-%s.log", u2.String())
-
-		if fileRequest, err = os.Create(requestFname); err != nil {
-			log.Fatalln(err.Error())
-		}
-		if fileResponse, err = os.Create(responseFname); err != nil {
-			log.Fatalln(err.Error())
-		}
-
-		defer fileRequest.Close()
-		defer fileResponse.Close()
-
-		p.fileRequest = fileRequest
-		p.fileResponse = fileResponse
-
-	}
-
-	log.Printf("Listening on %s...\n", listenAddress)
-	log.Fatal(http.ListenAndServe(listenAddress, p))
+	glog.Info("Listening on %s...\n", listenAddress)
+	glog.Fatal(http.ListenAndServe(listenAddress, p))
 }
