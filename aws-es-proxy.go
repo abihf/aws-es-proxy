@@ -2,11 +2,9 @@ package main
 
 import (
 	"bytes"
-	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -16,25 +14,9 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
-	v4 "github.com/aws/aws-sdk-go/aws/signer/v4"
-	"github.com/golang/glog"
+	signer "github.com/aws/aws-sdk-go/aws/signer/v4"
+	log "github.com/sirupsen/logrus"
 )
-
-type requestStruct struct {
-	Requestid  string
-	Datetime   string
-	Remoteaddr string
-	Requesturi string
-	Method     string
-	Statuscode int
-	Elapsed    float64
-	Body       string
-}
-
-type responseStruct struct {
-	Requestid string
-	Body      string
-}
 
 type proxy struct {
 	scheme      string
@@ -54,19 +36,12 @@ func noRedirect(req *http.Request, via []*http.Request) error {
 	return http.ErrUseLastResponse
 }
 
-func newProxy(args ...interface{}) *proxy {
-	return &proxy{
-		endpoint:  args[0].(string),
-		nosignreq: args[1].(bool),
-	}
-}
+func newProxy(endpoint string) (*proxy, error) {
+	p := &proxy{endpoint: endpoint}
 
-func (p *proxy) parseEndpoint() error {
-	var link *url.URL
-	var err error
-
-	if link, err = url.Parse(p.endpoint); err != nil {
-		return fmt.Errorf("error: failure while parsing endpoint: %s. Error: %s",
+	link, err := url.Parse(p.endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("error: failure while parsing endpoint: %s. Error: %s",
 			p.endpoint, err.Error())
 	}
 
@@ -79,7 +54,7 @@ func (p *proxy) parseEndpoint() error {
 
 	// Unknown schemes sometimes result in empty host value
 	if link.Host == "" {
-		return fmt.Errorf("error: empty host or protocol information in submitted endpoint (%s)",
+		return nil, fmt.Errorf("error: empty host or protocol information in submitted endpoint (%s)",
 			p.endpoint)
 	}
 
@@ -91,7 +66,7 @@ func (p *proxy) parseEndpoint() error {
 		if len(parts) == 5 {
 			p.region, p.service = parts[1], parts[2]
 		} else {
-			return fmt.Errorf("error: submitted endpoint is not a valid Amazon ElasticSearch Endpoint")
+			return nil, fmt.Errorf("error: submitted endpoint is not a valid Amazon ElasticSearch Endpoint")
 		}
 	}
 
@@ -99,18 +74,18 @@ func (p *proxy) parseEndpoint() error {
 	p.scheme = link.Scheme
 	p.host = link.Host
 
-	return nil
+	return p, nil
 }
 
-func (p *proxy) getSigner() *v4.Signer {
+func (p *proxy) getSigner() *signer.Signer {
 	// Refresh credentials after expiration. Required for STS
 	if p.credentials == nil {
 		sess := session.Must(session.NewSession())
 		credentials := sess.Config.Credentials
 		p.credentials = credentials
-		glog.Info("Generated fresh AWS Credentials object")
+		log.Info("Generated fresh AWS Credentials object")
 	}
-	return v4.NewSigner(p.credentials)
+	return signer.NewSigner(p.credentials)
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -123,7 +98,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	proxyReq, err := http.NewRequest(req.Method, url.String(), req.Body)
 	if err != nil {
-		glog.Fatalln("error creating new request. ", err.Error())
+		log.Fatalln("error creating new request. ", err.Error())
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -132,15 +107,15 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	// Make signV4 optional
 	if !p.nosignreq {
-		signer := p.getSigner()
+		s := p.getSigner()
 		// Start AWS session from ENV, Shared Creds or EC2Role
 		payload := bytes.NewReader(replaceBody(proxyReq))
-		signer.Sign(proxyReq, payload, p.service, p.region, time.Now())
+		s.Sign(proxyReq, payload, p.service, p.region, time.Now())
 	}
-	glog.Info("Proxying request to ES")
+	log.Info("Proxying request to ES")
 	resp, err := client.Do(proxyReq)
 	if err != nil {
-		glog.Fatalln(err.Error())
+		log.Fatalln(err.Error())
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -200,42 +175,31 @@ func copyHeaders(dst, src http.Header) {
 	}
 }
 
-func init() {
-	flag.Set("logtostderr", "true")
-	flag.Set("stderrthreshold", "WARNING")
-	flag.Set("v", "2")
+func getEnv(name, def string) string {
+	if val, ok := os.LookupEnv(name); ok {
+		return val
+	}
+	return def
 }
 
 func main() {
+	var err error
+	endpoint := getEnv("ES_ENDPOINT", "")
+	nosignreq := getEnv("ES_NO_SIGN", "0") == "1"
+	listenAddress := getEnv("LISTEN_ADDRESS", "0.0.0.0:80")
 
-	var (
-		nosignreq     bool
-		endpoint      string
-		listenAddress string
-		err           error
-	)
-
-	flag.StringVar(&endpoint, "endpoint", "", "Amazon ElasticSearch Endpoint (e.g: https://dummy-host.eu-west-1.es.amazonaws.com)")
-	flag.StringVar(&listenAddress, "listen", "127.0.0.1:9200", "Local TCP port to listen on")
-	flag.BoolVar(&nosignreq, "no-sign-reqs", false, "Disable AWS Signature v4")
-	flag.Parse()
-
-	if len(os.Args) < 3 {
-		fmt.Println("You need to specify Amazon ElasticSearch endpoint.")
-		fmt.Println("Please run with '-h' for a list of available arguments.")
+	if endpoint == "" {
+		fmt.Println("You need to specify Amazon ElasticSearch endpoint via environment variable ES_ENDPOINT.")
 		os.Exit(1)
 	}
 
-	p := newProxy(
-		endpoint,
-		nosignreq,
-	)
-
-	if err = p.parseEndpoint(); err != nil {
-		glog.Fatalln(err)
+	p, err := newProxy(endpoint)
+	if err != nil {
+		log.Fatalln(err)
 		os.Exit(1)
 	}
+	p.nosignreq = nosignreq
 
-	glog.Info("Listening on %s...\n", listenAddress)
-	glog.Fatal(http.ListenAndServe(listenAddress, p))
+	log.Info("Listening on %s...\n", listenAddress)
+	log.Fatal(http.ListenAndServe(listenAddress, p))
 }

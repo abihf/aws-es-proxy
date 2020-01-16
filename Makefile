@@ -1,5 +1,7 @@
-TAG=emanekat/aws-es-proxy:aws-es-proxy
+TAG = abihf/aws-es-proxy:latest
 
-release:
+build:
 	docker build -t ${TAG} .
+
+release: build
 	docker push ${TAG}

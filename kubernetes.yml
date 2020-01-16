@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: es-proxy
+spec:
+  selector:
+    matchLabels:
+      app: es-proxy
+  template:
+    metadata:
+      labels:
+        app: es-proxy
+    spec:
+      containers:
+        - name: es-proxy
+          image: abihf/aws-es-proxy:latest
+          env:
+            - name: ES_ENDPOINT
+              value: < YOUR END AWS ES ENDPOINT >
+          resources:
+            limits:
+              memory: "128Mi"
+              cpu: "500m"
+          ports:
+            - containerPort: 80

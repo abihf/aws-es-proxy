@@ -1,14 +1,14 @@
-FROM golang:1.13.5-alpine3.11
+FROM golang:1.13 AS build
+WORKDIR /build
+ADD go.mod .
+ADD go.sum .
+RUN go mod download
+ADD . .
+RUN GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags '-extldflags "-static"' -o aws-es-proxy
 
-WORKDIR /go/src/github.com/EmanekaT/aws-es-proxy
-COPY . .
-
-RUN apk add git \
-    && go get -v ./...
-
-CMD CGO_ENABLED=0 GOOS=linux go build -o /usr/local/bin/ aws-es-proxy.go
-
-RUN apk --no-cache add ca-certificates
-
-ENTRYPOINT ["aws-es-proxy"]
-CMD ["-h"]
+# real image
+FROM scratch
+WORKDIR /app
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem
+COPY --from=build /build/aws-es-proxy /app/aws-es-proxy
+CMD ["/app/aws-es-proxy"]
