@@ -98,7 +98,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	proxyReq, err := http.NewRequest(req.Method, url.String(), req.Body)
 	if err != nil {
-		log.Fatalln("error creating new request. ", err.Error())
+		log.WithError(err).Error("Error creating new request")
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -112,10 +112,10 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		payload := bytes.NewReader(replaceBody(proxyReq))
 		s.Sign(proxyReq, payload, p.service, p.region, time.Now())
 	}
-	log.Info("Proxying request to ES")
+	log.Debug("Proxying request to ES")
 	resp, err := client.Do(proxyReq)
 	if err != nil {
-		log.Fatalln(err.Error())
+		log.WithError(err).Error("Error forwarding request")
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -136,7 +136,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// Send response back to requesting client
 	body := bytes.Buffer{}
 	if _, err := io.Copy(&body, resp.Body); err != nil {
-		log.Fatalln(err.Error())
+		log.WithError(err).Error("Error forwarding response")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 	w.WriteHeader(resp.StatusCode)
